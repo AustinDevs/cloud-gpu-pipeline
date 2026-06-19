@@ -1,17 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 #
-# Setup script for SplatWalk runtime Volume — REPLACES snapshot-based approach.
+# Setup script for the SplatWalk runtime Volume.
 #
-# Installs the full SplatWalk runtime onto a DO Volume at /mnt/splatwalk/:
-#   Miniconda, PyTorch 2.4+CUDA 12.4, InstantSplat, ViewCrafter, PyTorch3D,
-#   model weights, pipeline scripts.
+# Installs the full pipeline runtime onto a DO Volume at /mnt/splatwalk/:
+#   Miniconda + Python 3.11, PyTorch 2.4 + CUDA 12.4, InstantSplat (with its
+#   compiled CUDA extensions), and the MASt3R/DUSt3R model weights.
 #
 # INCREMENTAL: Safe to re-run on an existing Volume. Each step checks
 # whether its work is already present and skips if so.
 #
 # Usage:
-#   1. Create a 100GB Volume in tor1 via DO console or API:
+#   1. Create a 100GB Volume in the GPU region via DO console or API:
 #        curl -s -X POST \
 #          -H "Authorization: Bearer $DO_API_TOKEN" \
 #          -H "Content-Type: application/json" \
@@ -19,8 +19,7 @@ set -euo pipefail
 #               "filesystem_type":"ext4"}' \
 #          "https://api.digitalocean.com/v2/volumes"
 #
-#   2. Create a GPU droplet in tor1 and attach the Volume:
-#        # Create droplet, attach volume, SSH in...
+#   2. Create a GPU droplet in the same region and attach the Volume:
 #        mount -o discard,defaults,noatime /dev/disk/by-id/scsi-0DO_Volume_splatwalk-* /mnt/splatwalk
 #
 #   3. Run this script:
@@ -28,6 +27,9 @@ set -euo pipefail
 #
 #   4. When done, unmount + detach Volume, destroy the droplet.
 #      The Volume persists and is reattached by pipeline droplets at runtime.
+#
+# Note: scripts/run_job.sh runs this automatically when it detects a fresh
+# Volume, so manual setup is only needed for debugging or pre-warming.
 #
 
 VOLUME_ROOT="/mnt/splatwalk"
@@ -46,7 +48,7 @@ echo "============================================"
 
 # --- Step 1: Verify GPU ---
 echo ""
-echo "=== Step 1/9: Verify GPU ==="
+echo "=== Step 1/7: Verify GPU ==="
 if ! nvidia-smi; then
     echo "ERROR: No NVIDIA GPU detected. This script must run on a GPU droplet."
     exit 1
@@ -56,7 +58,7 @@ echo "GPU: $GPU_NAME"
 
 # --- Step 2: System packages ---
 echo ""
-echo "=== Step 2/9: System packages ==="
+echo "=== Step 2/7: System packages ==="
 if command -v ffmpeg &>/dev/null && command -v git &>/dev/null && dpkg -s build-essential &>/dev/null 2>&1; then
     echo "System packages already installed — skipping"
 else
@@ -71,7 +73,7 @@ fi
 
 # --- Step 3: Miniconda + Python 3.11 ---
 echo ""
-echo "=== Step 3/9: Miniconda + Python 3.11 ==="
+echo "=== Step 3/7: Miniconda + Python 3.11 ==="
 if [ -x "$VOLUME_ROOT/conda/bin/python" ]; then
     echo "Miniconda already installed on Volume"
 else
@@ -92,9 +94,9 @@ if [ "$PYVER" != "3.11" ]; then
 fi
 echo "Python: $(python --version 2>&1)"
 
-# --- Step 4: PyTorch + CUDA + all Python deps ---
+# --- Step 4: PyTorch + CUDA + Python deps ---
 echo ""
-echo "=== Step 4/9: PyTorch + CUDA + Python packages ==="
+echo "=== Step 4/7: PyTorch + CUDA + Python packages ==="
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 
 if python -c "import torch; assert torch.cuda.is_available(); print(f'PyTorch {torch.__version__} CUDA OK')" 2>/dev/null; then
@@ -109,40 +111,16 @@ fi
 # Ensure build tools are available for CUDA extension compilation
 pip install --no-cache-dir setuptools wheel 2>&1 | tail -1
 
-# Runtime Python packages
 echo "Installing runtime Python packages..."
 pip install --no-cache-dir \
-    icecream open3d trimesh "pyglet<2" evo matplotlib tensorboard imageio gdown \
-    roma opencv-python transformers huggingface_hub \
-    omegaconf pytorch-lightning open-clip-torch kornia decord \
-    imageio-ffmpeg scikit-image moviepy "av<14" 2>&1 | tail -5
-
-# Base Python packages
-pip install --no-cache-dir "numpy<2" scipy pillow tqdm einops timm boto3 awscli plyfile 2>&1 | tail -3
-
-# Real-ESRGAN (deterministic 2x upscale for ortho tiles)
-echo "Installing Real-ESRGAN..."
-pip install --no-cache-dir realesrgan 2>&1 | tail -3
-
-# Gemini API SDK (for Gemini-based captioning)
-echo "Installing google-genai SDK..."
-pip install --no-cache-dir google-genai 2>&1 | tail -1
-
-# Geospatial packages (for 3DEP DEM + ground-level view generation)
-echo "Installing geospatial packages (py3dep, rioxarray, pyproj)..."
-pip install --no-cache-dir py3dep rioxarray rasterio pyproj 2>&1 | tail -3
-
-# Stage 4: Game-level scene construction packages
-echo "Installing game scene construction packages (pygltflib, pvlib, SAM2)..."
-pip install --no-cache-dir pygltflib pvlib 2>&1 | tail -3
-# SAM2: install with --no-deps to avoid upgrading torch (breaks compiled CUDA extensions)
-pip install --no-cache-dir --no-deps "git+https://github.com/facebookresearch/sam2.git" 2>&1 | tail -5 \
-    || echo "WARNING: SAM2 install failed (scene construction will use fallback segmentation)"
-pip install --no-cache-dir hydra-core iopath 2>&1 | tail -3 || true
+    "numpy<2" scipy pillow tqdm einops timm roma \
+    opencv-python scikit-image matplotlib tensorboard \
+    imageio imageio-ffmpeg trimesh \
+    plyfile boto3 awscli huggingface_hub 2>&1 | tail -5
 
 # --- Step 5: InstantSplat + CUDA extensions ---
 echo ""
-echo "=== Step 5/9: InstantSplat + CUDA extensions ==="
+echo "=== Step 5/7: InstantSplat + CUDA extensions ==="
 
 if [ -d "$VOLUME_ROOT/InstantSplat" ]; then
     echo "InstantSplat repo already cloned — skipping clone"
@@ -198,81 +176,9 @@ pip install --no-cache-dir -r requirements.txt 2>&1 | tail -3 || true
 # Strip .git dirs to save space
 find "$VOLUME_ROOT/InstantSplat" -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
 
-# ViewCrafter (kept for future re-enablement)
-if [ -d "$VOLUME_ROOT/ViewCrafter" ]; then
-    echo "ViewCrafter repo already cloned — skipping clone"
-else
-    echo "Cloning ViewCrafter..."
-    git clone https://github.com/Drexubery/ViewCrafter.git "$VOLUME_ROOT/ViewCrafter"
-    rm -rf "$VOLUME_ROOT/ViewCrafter/.git"
-fi
-
-echo "Installing ViewCrafter requirements..."
-cd "$VOLUME_ROOT/ViewCrafter"
-pip install --no-cache-dir -r requirements.txt 2>&1 | tail -3 || true
-
-# PyTorch3D with CUDA kernels
-echo ""
-echo "Building PyTorch3D from source with CUDA support..."
-echo "FORCE_CUDA=1  TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
-
-EXISTING_SO=$(find "$VOLUME_ROOT/conda/lib/python"*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1 || true)
-NEED_REBUILD=1
-if [ -n "$EXISTING_SO" ]; then
-    SO_SIZE=$(stat -c%s "$EXISTING_SO" 2>/dev/null || stat -f%z "$EXISTING_SO" 2>/dev/null || echo 0)
-    SO_SIZE_MB=$((SO_SIZE / 1024 / 1024))
-    echo "Existing _C.so: ${SO_SIZE_MB}MB ($EXISTING_SO)"
-    if [ "$SO_SIZE_MB" -ge 15 ]; then
-        echo "PyTorch3D already has CUDA kernels (${SO_SIZE_MB}MB) — skipping rebuild"
-        NEED_REBUILD=0
-    else
-        echo "Existing _C.so is only ${SO_SIZE_MB}MB — needs rebuild"
-    fi
-fi
-
-if [ "$NEED_REBUILD" -eq 1 ]; then
-    pip uninstall -y pytorch3d 2>/dev/null || true
-    rm -rf "$VOLUME_ROOT/conda/lib/python"*/site-packages/pytorch3d* 2>/dev/null || true
-
-    echo "Compiling PyTorch3D from source (takes ~15-20 min on H100)..."
-    FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
-        pip install --no-cache-dir --no-build-isolation \
-        "git+https://github.com/facebookresearch/pytorch3d.git" \
-        > /tmp/pytorch3d_build.log 2>&1 || {
-            echo "PyTorch3D build failed! Last 50 lines:"
-            tail -50 /tmp/pytorch3d_build.log
-            exit 1
-        }
-    echo "Build finished. Checking _C.so..."
-
-    PYTORCH3D_SO=$(find "$VOLUME_ROOT/conda/lib/python"*/site-packages/pytorch3d -name "_C*.so" 2>/dev/null | head -1)
-    if [ -n "$PYTORCH3D_SO" ]; then
-        SO_SIZE=$(stat -c%s "$PYTORCH3D_SO" 2>/dev/null || stat -f%z "$PYTORCH3D_SO" 2>/dev/null)
-        SO_SIZE_MB=$((SO_SIZE / 1024 / 1024))
-        echo "_C.so size: ${SO_SIZE_MB}MB"
-        if [ "$SO_SIZE_MB" -lt 15 ]; then
-            echo "ERROR: _C.so is only ${SO_SIZE_MB}MB — CUDA kernels were NOT compiled!"
-            tail -50 /tmp/pytorch3d_build.log
-            exit 1
-        fi
-        echo "Size looks good (>15MB = CUDA kernels present)"
-    else
-        echo "ERROR: _C.so not found!"
-        exit 1
-    fi
-fi
-
-# Patch ANTIALIAS -> LANCZOS for Pillow 10+
-echo ""
-echo "Patching ViewCrafter for Pillow 10+ (ANTIALIAS -> LANCZOS)..."
-grep -rl "Image.ANTIALIAS" "$VOLUME_ROOT/ViewCrafter/" 2>/dev/null | while read f; do
-    sed -i "s/Image.ANTIALIAS/Image.LANCZOS/g" "$f"
-    echo "  Patched $f"
-done || echo "  No files needed patching"
-
 # --- Step 6: Model weights ---
 echo ""
-echo "=== Step 6/9: Model weights ==="
+echo "=== Step 6/7: Model weights ==="
 
 mkdir -p "$VOLUME_ROOT/models/dust3r" "$VOLUME_ROOT/models/mast3r"
 
@@ -305,138 +211,13 @@ MAST3R_ALT="$VOLUME_ROOT/InstantSplat/submodules/mast3r/checkpoints"
 mkdir -p "$MAST3R_ALT"
 ln -sf "$MAST3R_CKPT" "$MAST3R_ALT/" 2>/dev/null || true
 
-# ViewCrafter checkpoint links
-mkdir -p "$VOLUME_ROOT/ViewCrafter/checkpoints" 2>/dev/null || true
-ln -sf "$DUST3R_CKPT" "$VOLUME_ROOT/ViewCrafter/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth" 2>/dev/null || true
-
-# ViewCrafter sparse checkpoint
-if [ -f "$VOLUME_ROOT/ViewCrafter/checkpoints/model_sparse.ckpt" ]; then
-    echo "ViewCrafter sparse checkpoint already present — skipping"
-else
-    echo "Downloading ViewCrafter sparse checkpoint..."
-    python -c "
-from huggingface_hub import hf_hub_download
-import os
-ckpt_dir = '$VOLUME_ROOT/ViewCrafter/checkpoints'
-os.makedirs(ckpt_dir, exist_ok=True)
-try:
-    path = hf_hub_download(repo_id='Drexubery/ViewCrafter_25', filename='model.ckpt',
-                           local_dir=ckpt_dir, local_dir_use_symlinks=False)
-    sparse_path = os.path.join(ckpt_dir, 'model_sparse.ckpt')
-    if not os.path.exists(sparse_path):
-        os.rename(path, sparse_path)
-    print(f'Sparse checkpoint: {sparse_path} ({os.path.getsize(sparse_path) / 1e9:.1f}GB)')
-except Exception as e:
-    print(f'WARNING: Could not download sparse checkpoint: {e}')
-" || true
-fi
-
-# Pre-download Real-ESRGAN model weights
-echo "Pre-downloading Real-ESRGAN x2plus model..."
-python -c "
-import os, urllib.request
-model_dir = '$VOLUME_ROOT/models'
-model_path = os.path.join(model_dir, 'RealESRGAN_x2plus.pth')
-if not os.path.exists(model_path):
-    url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
-    print(f'Downloading {url}...')
-    urllib.request.urlretrieve(url, model_path)
-    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-else:
-    print(f'Real-ESRGAN model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-" || echo "WARNING: Real-ESRGAN model download failed (will download at runtime)"
-
-# Real-ESRGAN x4plus model (for Stage 4 super-resolution)
-echo "Pre-downloading Real-ESRGAN x4plus model..."
-python -c "
-import os, urllib.request
-model_dir = '$VOLUME_ROOT/models'
-model_path = os.path.join(model_dir, 'RealESRGAN_x4plus.pth')
-if not os.path.exists(model_path):
-    url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth'
-    print(f'Downloading {url}...')
-    urllib.request.urlretrieve(url, model_path)
-    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-else:
-    print(f'Real-ESRGAN x4plus model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-" || echo "WARNING: Real-ESRGAN x4plus model download failed (will download at runtime)"
-
-# SAM2 model weights (for Stage 4 scene segmentation)
-echo "Pre-downloading SAM2 model weights..."
-mkdir -p "$VOLUME_ROOT/models/sam2"
-python -c "
-import os, urllib.request
-model_dir = '$VOLUME_ROOT/models/sam2'
-model_path = os.path.join(model_dir, 'sam2.1_hiera_large.pt')
-if not os.path.exists(model_path):
-    url = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt'
-    print(f'Downloading SAM2 weights (~898MB...')
-    urllib.request.urlretrieve(url, model_path)
-    print(f'Saved to {model_path} ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-else:
-    print(f'SAM2 model already present ({os.path.getsize(model_path) / 1e6:.1f}MB)')
-" || echo "WARNING: SAM2 model download failed (scene construction will use fallback segmentation)"
-
-# PBR texture library from ambientCG (CC0, for Stage 4 game scene materials)
-echo "Downloading PBR texture library from ambientCG..."
-TEXTURE_DIR="$VOLUME_ROOT/textures"
-mkdir -p "$TEXTURE_DIR"
-python -c "
-import os, urllib.request, zipfile, tempfile
-texture_dir = '$TEXTURE_DIR'
-materials = {
-    'grass': 'Ground054',
-    'concrete': 'Concrete034',
-    'asphalt': 'Asphalt012',
-    'gravel': 'Ground037',
-    'bare_soil': 'Ground048',
-    'mulch': 'Ground042',
-    'wood_deck': 'Wood051',
-    'roof_shingle': 'RoofingTiles006',
-}
-for mat_name, acg_id in materials.items():
-    mat_dir = os.path.join(texture_dir, mat_name)
-    if os.path.isdir(mat_dir) and len(os.listdir(mat_dir)) >= 2:
-        print(f'  {mat_name}: already present — skipping')
-        continue
-    os.makedirs(mat_dir, exist_ok=True)
-    url = f'https://ambientcg.com/get?file={acg_id}_2K-JPG.zip'
-    print(f'  Downloading {mat_name} ({acg_id})...')
-    try:
-        tmp = os.path.join(mat_dir, 'download.zip')
-        urllib.request.urlretrieve(url, tmp)
-        with zipfile.ZipFile(tmp) as zf:
-            for member in zf.namelist():
-                lower = member.lower()
-                if any(k in lower for k in ('color', 'normal', 'roughness', 'displacement')):
-                    # Extract with flat name
-                    basename = os.path.basename(member)
-                    if 'color' in lower:
-                        dest = 'albedo.jpg'
-                    elif 'normal' in lower and 'gl' in lower:
-                        dest = 'normal.jpg'
-                    elif 'normal' in lower:
-                        dest = 'normal.jpg'
-                    elif 'roughness' in lower:
-                        dest = 'roughness.jpg'
-                    else:
-                        continue
-                    with zf.open(member) as src, open(os.path.join(mat_dir, dest), 'wb') as dst:
-                        dst.write(src.read())
-        os.remove(tmp)
-        print(f'  {mat_name}: extracted to {mat_dir}')
-    except Exception as e:
-        print(f'  WARNING: {mat_name} download failed: {e}')
-print('PBR texture library download complete')
-" || echo "WARNING: PBR texture download failed (scene will use orthophoto drape only)"
-
-# --- Step 7: Pipeline scripts ---
+# --- Step 7: Pipeline scripts + verification ---
 echo ""
-echo "=== Step 7/9: Pipeline scripts ==="
+echo "=== Step 7/7: Pipeline scripts + verification ==="
 
 mkdir -p "$VOLUME_ROOT/scripts"
 
-# Try to find scripts from the repo (if run from repo root or SCP'd alongside)
+# Copy scripts if running from a checkout (runtime droplets re-fetch from GitHub anyway)
 SCRIPT_DIR=""
 if [ -d "$(dirname "$0")/gpu" ]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")/gpu" && pwd)"
@@ -446,7 +227,7 @@ fi
 
 if [ -n "$SCRIPT_DIR" ]; then
     echo "Copying pipeline scripts from $SCRIPT_DIR to $VOLUME_ROOT/scripts/..."
-    for script in run_pipeline.sh render_descent.py generate_ground_views.py generate_tiered_views.py compress_splat.py quality_gate.py generate_viewer_assets.py; do
+    for script in run_pipeline.sh render_zoom_descent.py compress_splat.py generate_viewer_assets.py; do
         if [ -f "$SCRIPT_DIR/$script" ]; then
             cp "$SCRIPT_DIR/$script" "$VOLUME_ROOT/scripts/$script"
             echo "  Copied $script"
@@ -456,70 +237,20 @@ if [ -n "$SCRIPT_DIR" ]; then
     done
     chmod +x "$VOLUME_ROOT/scripts/run_pipeline.sh" 2>/dev/null || true
 else
-    echo "WARNING: Pipeline scripts directory not found."
-    echo "  Expected either repo at $(dirname "$0")/gpu"
-    echo "  or SCP'd scripts at /root/pipeline-scripts/"
-    echo "  Scripts will be fetched from GitHub at runtime instead."
+    echo "No local scripts found — they will be fetched from GitHub at runtime."
 fi
-
-# --- Step 8: ODM Docker image (for orthomosaic generation) ---
-echo ""
-echo "=== Step 8/9: ODM Docker image ==="
-ODM_TAR="$VOLUME_ROOT/odm-docker.tar.gz"
-if [ -f "$ODM_TAR" ]; then
-    echo "ODM Docker image already cached on Volume ($(du -h "$ODM_TAR" | cut -f1))"
-else
-    if command -v docker &>/dev/null; then
-        echo "Pulling and caching ODM Docker image..."
-        docker pull opendronemap/odm:latest
-        docker save opendronemap/odm:latest | gzip > "$ODM_TAR"
-        echo "Saved ODM image ($(du -h "$ODM_TAR" | cut -f1))"
-    else
-        echo "Docker not available — skipping ODM image cache"
-        echo "  Install Docker and re-run to enable ODM orthomosaic generation"
-    fi
-fi
-
-# --- Step 9: Verification ---
-echo ""
-echo "=== Step 9/9: Verification ==="
 
 echo "Checking key imports..."
 python -c "
 import torch; print(f'PyTorch {torch.__version__}')
 print(f'CUDA available: {torch.cuda.is_available()}')
 print(f'GPU: {torch.cuda.get_device_name(0)}')
-import open3d; print(f'Open3D {open3d.__version__}')
-import trimesh; print(f'Trimesh {trimesh.__version__}')
-import kornia; print(f'Kornia {kornia.__version__}')
-import transformers; print(f'Transformers {transformers.__version__}')
-import realesrgan; print('Real-ESRGAN OK')
-import pygltflib; print(f'pygltflib {pygltflib.__version__}')
-import pvlib; print(f'pvlib {pvlib.__version__}')
+import diff_gaussian_rasterization; print('diff-gaussian-rasterization OK')
+import simple_knn; print('simple-knn OK')
+import plyfile; print('plyfile OK')
+import boto3; print('boto3 OK')
 print('All imports OK')
 "
-
-echo ""
-echo "Testing PyTorch3D GPU rasterization..."
-python -c "
-import torch
-import pytorch3d
-print(f'PyTorch3D {pytorch3d.__version__}')
-from pytorch3d.structures import Pointclouds
-from pytorch3d.renderer import PointsRasterizer, PointsRasterizationSettings, PerspectiveCameras
-pts = torch.randn(1, 100, 3).cuda()
-features = torch.randn(1, 100, 3).cuda()
-pc = Pointclouds(points=pts, features=features)
-cameras = PerspectiveCameras(device='cuda')
-settings = PointsRasterizationSettings(image_size=64, radius=0.01, points_per_pixel=1)
-rasterizer = PointsRasterizer(cameras=cameras, raster_settings=settings)
-fragments = rasterizer(pc)
-print(f'Rasterized: idx shape={fragments.idx.shape}')
-print('PyTorch3D GPU rasterization: PASSED')
-" || {
-    echo "ERROR: PyTorch3D GPU rasterization FAILED"
-    exit 1
-}
 
 # Cleanup
 echo ""
@@ -539,16 +270,13 @@ echo "============================================"
 echo "Volume setup complete!"
 echo "============================================"
 echo ""
-echo "Volume contents at $VOLUME_ROOT:"
-ls -la "$VOLUME_ROOT/"
-echo ""
 echo "To use this Volume with pipeline droplets:"
 echo "  1. Set DO_VOLUME_ID in .env to this Volume's ID"
 echo "  2. Set GPU_DROPLET_IMAGE to any stock DO GPU base image"
-echo "  3. Ensure GPU_DROPLET_REGION=tor1 (same region as Volume)"
+echo "  3. Ensure GPU_DROPLET_REGION matches the Volume's region"
 echo ""
 echo "To update dependencies later:"
-echo "  1. Launch any GPU droplet in tor1, attach + mount this Volume"
+echo "  1. Launch any GPU droplet in the same region, attach + mount this Volume"
 echo "  2. export PATH=$VOLUME_ROOT/conda/bin:\$PATH"
 echo "  3. pip install <package> or conda install <package>"
 echo "  4. Unmount + detach Volume, destroy droplet"

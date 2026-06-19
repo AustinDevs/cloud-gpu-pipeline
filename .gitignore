@@ -31,3 +31,6 @@ odm_data_*/
 
 # Playwright MCP
 /.playwright-mcp
+
+# Python
+__pycache__/

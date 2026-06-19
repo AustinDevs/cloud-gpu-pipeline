@@ -49,7 +49,7 @@ def notify_slack(message, webhook_url, job_id, status="info"):
         return
     import urllib.request
     emoji = {"info": "\U0001f504", "success": "\u2705", "error": "\u274c"}.get(status, "\U0001f504")
-    payload = json.dumps({"text": f"{emoji} *[{job_id[:8]}] walkable* \u2014 {message}"})
+    payload = json.dumps({"text": f"{emoji} *[{job_id[:8]}] descent* \u2014 {message}"})
     try:
         req = urllib.request.Request(
             webhook_url,
@@ -129,77 +129,6 @@ def notify_slack_with_image(message, image_path, webhook_url, job_id, status="in
         urllib.request.urlopen(req, timeout=5)
     except Exception:
         notify_slack(message, webhook_url, job_id, status)
-
-
-def verify_mosaic_with_gemini(mosaic_path, level_name, webhook_url, job_id):
-    """Send descent mosaic to Gemini Vision for quality check. Returns True=PASS.
-
-    Raises RuntimeError on FAIL so the pipeline aborts.
-    """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key:
-        print(f"  Gemini verify skipped (no API key)")
-        return True
-
-    try:
-        import base64
-        import urllib.request
-        from PIL import Image as PILImage
-
-        img = PILImage.open(mosaic_path).convert("RGB")
-        img.thumbnail((512, 512))
-
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-
-        prompt = (
-            "This is a stitched mosaic of rendered views from a Gaussian Splat at "
-            f"{level_name}. Does it look like a coherent aerial view of terrain? "
-            "Check for: black gaps, washed-out regions, splat artifacts, missing "
-            "detail, blurry areas. Reply PASS or FAIL followed by a one-sentence reason."
-        )
-
-        payload = json.dumps({
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                ]
-            }]
-        })
-
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={gemini_key}"
-        )
-        req = urllib.request.Request(
-            url, data=payload.encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(resp.read())
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-        passed = text.upper().startswith("PASS")
-        status = "success" if passed else "error"
-        print(f"  Gemini verify [{level_name}]: {text}")
-
-        emoji = "\u2705" if passed else "\u26a0\ufe0f"
-        notify_slack(
-            f"{emoji} Gemini verify [{level_name}]: {text}",
-            webhook_url, job_id, status,
-        )
-
-        if not passed:
-            raise RuntimeError(f"Gemini quality check FAILED at {level_name}: {text}")
-        return True
-    except RuntimeError:
-        raise  # Re-raise quality failures
-    except Exception as e:
-        print(f"  Gemini verify failed ({e}), continuing")
-        return True  # Don't block on API issues
 
 
 def load_point_cloud(model_path):
@@ -580,69 +509,19 @@ def retrain_model(scene_path, model_path, output_model_path, iterations, n_views
 
 
 # ---------------------------------------------------------------------------
-# Scene caption
+# Mosaic stitching for Slack previews
 # ---------------------------------------------------------------------------
 
-def caption_scene(scene_images_dir):
-    """Generate a scene description using Gemini."""
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if not gemini_key:
-        return "grass, trees, pavement, residential area"
-
-    try:
-        import base64
-        import urllib.request
-        from PIL import Image as PILImage
-
-        # Pick one aerial image
-        images = sorted(Path(scene_images_dir).glob("*.jpg"))
-        if not images:
-            return "grass, trees, pavement, residential area"
-
-        img = PILImage.open(images[0]).convert("RGB")
-        img.thumbnail((512, 512))
-
-        import io
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=80)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-
-        payload = json.dumps({
-            "contents": [{
-                "parts": [
-                    {"text": "Describe what terrain and features are visible in this aerial/drone photo in 10 words or less. Just list the terrain types, no sentences."},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                ]
-            }]
-        })
-
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-        req = urllib.request.Request(url, data=payload.encode(),
-                                     headers={"Content-Type": "application/json"})
-        resp = urllib.request.urlopen(req, timeout=30)
-        data = json.loads(resp.read())
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        print(f"  Scene caption: {text}")
-        return text
-    except Exception as e:
-        print(f"  Captioning failed ({e}), using default")
-        return "grass, trees, pavement, residential area"
-
-
-# ---------------------------------------------------------------------------
-# Mosaic stitching for quality check
-# ---------------------------------------------------------------------------
-
-def stitch_level_mosaic(render_dir, cameras, odm_orthophoto_path=None):
+def stitch_level_mosaic(render_dir, cameras):
     """Stitch rendered tiles into a single mosaic from camera grid positions.
 
-    Returns (mosaic_path, ssim_score). ssim_score is None if no ODM reference.
+    Returns the mosaic path, or None if there was nothing to stitch.
     """
     from PIL import Image as PILImage
 
     render_files = sorted(Path(render_dir).glob("*.jpg"))
     if not render_files or not cameras:
-        return None, None
+        return None
 
     # Get camera XY positions
     centers = np.array([c["center"][:2] for c in cameras[:len(render_files)]])
@@ -690,29 +569,7 @@ def stitch_level_mosaic(render_dir, cameras, odm_orthophoto_path=None):
     mosaic.save(mosaic_path, "JPEG", quality=90)
     print(f"  Stitched mosaic: {mosaic_w}x{mosaic_h} ({n_x}x{n_y} grid)")
 
-    # Compare against ODM orthophoto if available
-    ssim_score = None
-    if odm_orthophoto_path and os.path.exists(odm_orthophoto_path):
-        try:
-            import cv2
-            from skimage.metrics import structural_similarity as ssim
-
-            # Load ODM orthophoto and resize to match mosaic
-            odm_img = cv2.imread(odm_orthophoto_path)
-            if odm_img is not None:
-                odm_resized = cv2.resize(odm_img, (mosaic_w, mosaic_h),
-                                         interpolation=cv2.INTER_AREA)
-                mosaic_cv = cv2.cvtColor(np.array(mosaic), cv2.COLOR_RGB2BGR)
-
-                # Compute SSIM
-                ssim_score = ssim(odm_resized, mosaic_cv, channel_axis=2)
-                print(f"  SSIM vs ODM orthophoto: {ssim_score:.3f}")
-        except ImportError:
-            print("  skimage not available, skipping SSIM")
-        except Exception as e:
-            print(f"  SSIM computation failed: {e}")
-
-    return mosaic_path, ssim_score
+    return mosaic_path
 
 
 # ---------------------------------------------------------------------------
@@ -829,8 +686,6 @@ def main():
     )
     parser.add_argument("--slack_webhook_url", default="", help="Slack webhook URL")
     parser.add_argument("--job_id", default="", help="Job ID for Slack notifications")
-    parser.add_argument("--odm_orthophoto", default="",
-                        help="Path to ODM orthophoto for SSIM comparison at each level")
     args = parser.parse_args()
 
     altitudes = [float(a) for a in args.altitudes.split(",")]
@@ -890,26 +745,13 @@ def main():
         render_from_splat(current_model_path, cameras, render_dir, args.scene_path)
 
         # Stitch rendered tiles into mosaic + send to Slack
-        mosaic_path, ssim_score = stitch_level_mosaic(
-            render_dir, cameras,
-            odm_orthophoto_path=args.odm_orthophoto if args.odm_orthophoto else None,
-        )
+        mosaic_path = stitch_level_mosaic(render_dir, cameras)
         if mosaic_path:
-            ssim_str = f" | SSIM={ssim_score:.3f}" if ssim_score is not None else ""
             notify_slack_with_image(
                 f"Level {level_idx+1}/{len(altitudes)} renders (~{real_alt:.0f}m AGL, "
-                f"{len(cameras)} views{ssim_str})",
+                f"{len(cameras)} views)",
                 mosaic_path, args.slack_webhook_url, args.job_id,
             )
-            try:
-                verify_mosaic_with_gemini(
-                    mosaic_path,
-                    f"Level {level_idx+1} (~{real_alt:.0f}m AGL)",
-                    args.slack_webhook_url, args.job_id,
-                )
-            except RuntimeError as e:
-                notify_slack(f"ABORT: {e}", args.slack_webhook_url, args.job_id, "error")
-                sys.exit(1)
 
         # Add renders to training set
         added = 0

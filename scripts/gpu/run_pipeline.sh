@@ -3,27 +3,47 @@ set -e
 export PATH="/mnt/splatwalk/conda/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
 shopt -s nocaseglob  # case-insensitive globbing (matches .JPG, .jpg, .Jpg, etc.)
 
-# Environment variables expected:
-# INPUT_DIR - Directory containing input images
-# OUTPUT_DIR - Directory for output files
-# PIPELINE_MODE - viewcrafter, instantsplat, combined, walkable, or mesh
-# JOB_ID - Job identifier
-# SPACES_KEY - DO Spaces access key
-# SPACES_SECRET - DO Spaces secret key
-# SPACES_BUCKET - DO Spaces bucket name
-# SPACES_REGION - DO Spaces region
-# SPACES_ENDPOINT - DO Spaces endpoint
-# SLACK_WEBHOOK_URL - (optional) Slack incoming webhook for progress notifications
-# MAX_N_VIEWS - (optional) Max views for MASt3R, default 24 (use 16 for 20GB GPUs)
-# VIEWCRAFTER_BATCH_SIZE - (optional) Frames per ViewCrafter run, default 10 (use 5 for 20GB GPUs)
-# TRAIN_ITERATIONS - (optional) Stage 2 training iterations, default 7000
+# ============================================================================
+# SplatWalk GPU Pipeline Orchestrator
+#
+# Runs on the GPU droplet. Takes a directory of images (ground-level photos,
+# drone photos, or a mix) and produces a web-viewable .splat + manifest on
+# DO Spaces.
+#
+# Pipeline modes (PIPELINE_MODE):
+#   splat   (default) Images -> MASt3R geometry -> InstantSplat training ->
+#           prune/compress -> .splat + manifest on CDN.
+#           Works for ground-level photo sets, drone sets, or mixed.
+#   aerial  Same as splat, plus the top-down progressive zoom descent
+#           (render + retrain at 5 altitude levels). Only useful when the
+#           input is predominantly nadir drone imagery.
+#
+# Required environment variables:
+#   INPUT_DIR      Directory containing input images (or a video file)
+#   OUTPUT_DIR     Directory for output files
+#   JOB_ID         Job identifier (used in CDN paths: demo/$JOB_ID/...)
+#   SPACES_KEY / SPACES_SECRET / SPACES_BUCKET / SPACES_REGION / SPACES_ENDPOINT
+#
+# Optional:
+#   PIPELINE_MODE        splat (default) or aerial
+#   SLACK_WEBHOOK_URL    Slack incoming webhook for progress notifications
+#   MAX_N_VIEWS          Max views for MASt3R (default 24; use 16 on 20GB GPUs)
+#   TRAIN_ITERATIONS     Stage 2 training iterations (default 10000)
+#   IMAGE_SIZE           Preprocessed image size in px (default 512)
+#   SCENE_SCALE          Uniform viewer scale (default 50.0)
+#   PRUNE_RATIO          Fraction of Gaussians pruned at compression (default 0.20)
+#   DESCENT_ALTITUDES    Aerial mode altitude fractions (default 1.0,0.5,0.25,0.12,0.05)
+#   DESCENT_ITERATIONS   Aerial mode retrain iterations per level (default 2000)
+# ============================================================================
 
-# --- Fetch latest Python scripts from GitHub (allows hotfixes without Docker rebuild) ---
+PIPELINE_MODE="${PIPELINE_MODE:-splat}"
+
+# --- Fetch latest Python scripts from GitHub (allows hotfixes without rebuilding the volume) ---
 echo "Updating pipeline scripts from GitHub..."
 _CURL_ARGS=(-fsSL -H "Accept: application/vnd.github.raw")
 [ -n "$GITHUB_TOKEN" ] && _CURL_ARGS+=(-H "Authorization: token $GITHUB_TOKEN")
 _BASE_URL="https://api.github.com/repos/AustinDevs/splatwalk/contents/scripts/gpu"
-for _script in render_zoom_descent.py compress_splat.py quality_gate.py generate_viewer_assets.py generate_ortho_tiles.py generate_ground_views.py align_geo_colmap.py build_game_scene.py generate_aerial_glb.py gemini_score_scene.py; do
+for _script in render_zoom_descent.py compress_splat.py generate_viewer_assets.py; do
     if curl "${_CURL_ARGS[@]}" "$_BASE_URL/$_script" -o "/mnt/splatwalk/scripts/$_script" 2>/dev/null; then
         echo "  Updated $_script"
     else
@@ -57,9 +77,9 @@ notify_slack() {
 }
 
 # Validate required environment variables
-if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$PIPELINE_MODE" ] || [ -z "$JOB_ID" ]; then
+if [ -z "$INPUT_DIR" ] || [ -z "$OUTPUT_DIR" ] || [ -z "$JOB_ID" ]; then
     echo "Error: Missing required environment variables"
-    echo "Required: INPUT_DIR, OUTPUT_DIR, PIPELINE_MODE, JOB_ID"
+    echo "Required: INPUT_DIR, OUTPUT_DIR, JOB_ID"
     exit 1
 fi
 
@@ -68,7 +88,14 @@ if [ -z "$SPACES_KEY" ] || [ -z "$SPACES_SECRET" ] || [ -z "$SPACES_BUCKET" ]; t
     exit 1
 fi
 
-# Create output directory
+case "$PIPELINE_MODE" in
+    splat|aerial) ;;
+    *)
+        echo "Error: Unknown pipeline mode: $PIPELINE_MODE (expected: splat, aerial)"
+        exit 1
+        ;;
+esac
+
 mkdir -p "$OUTPUT_DIR"
 
 # Configure AWS CLI for DO Spaces
@@ -76,836 +103,206 @@ export AWS_ACCESS_KEY_ID="$SPACES_KEY"
 export AWS_SECRET_ACCESS_KEY="$SPACES_SECRET"
 export AWS_DEFAULT_REGION="$SPACES_REGION"
 
-# Detect video input
+fail() {
+    notify_slack "$1" "error"
+    echo "FATAL: $1"
+    exit 1
+}
+
+# ============================================================================
+# Stage 0: Input preparation
+# ============================================================================
+
+# Video input: extract frames at 1 fps
 VIDEO_FILE=$(ls -1 "$INPUT_DIR"/*.mov "$INPUT_DIR"/*.mp4 2>/dev/null | head -1)
 if [ -n "$VIDEO_FILE" ]; then
-    echo "Found video input: $VIDEO_FILE"
-    HAS_VIDEO=1
-else
-    HAS_VIDEO=0
-    # Count input images
-    IMAGE_COUNT=$(ls -1 "$INPUT_DIR"/*.jpg 2>/dev/null | wc -l)
-    echo "Found $IMAGE_COUNT input images"
-
-    if [ "$IMAGE_COUNT" -lt 2 ]; then
-        echo "Error: Need at least 2 input images"
-        exit 1
-    fi
+    echo "Found video input: $VIDEO_FILE — extracting frames at 1 fps..."
+    FRAMES_DIR="$INPUT_DIR/frames"
+    mkdir -p "$FRAMES_DIR"
+    ffmpeg -i "$VIDEO_FILE" -qscale:v 1 -vf "fps=1" "$FRAMES_DIR/frame-%04d.jpg" 2>&1
+    export INPUT_DIR="$FRAMES_DIR"
 fi
 
-# Create manifest template
-create_manifest() {
-    local status="$1"
-    local splat_url="${2:-}"
-    local thumbnail_url="${3:-}"
-    local error="${4:-}"
+IMAGE_COUNT=$(find "$INPUT_DIR" -maxdepth 1 -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) | wc -l | tr -d ' ')
+echo "Found $IMAGE_COUNT input images"
+if [ "$IMAGE_COUNT" -lt 2 ]; then
+    fail "Need at least 2 input images (found $IMAGE_COUNT)"
+fi
+notify_slack "Starting $PIPELINE_MODE pipeline with $IMAGE_COUNT images"
 
-    cat > "$OUTPUT_DIR/manifest.json" << EOF
-{
-    "jobId": "$JOB_ID",
-    "pipeline": "$PIPELINE_MODE",
-    "status": "$status",
-    "splatUrl": "$splat_url",
-    "thumbnailUrl": "$thumbnail_url",
-    "error": "$error",
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-}
+# Preprocess: resize all images to a consistent square size.
+# InstantSplat requires every image in a scene to have identical dimensions,
+# and the input may mix landscape ground shots with portrait/drone frames.
+# Strategy: scale so the short side hits IMAGE_SIZE, then center-crop.
+SCENE_DIR="$OUTPUT_DIR/scene"
+mkdir -p "$SCENE_DIR/images"
+export SCENE_DIR
+export IMAGE_SIZE="${IMAGE_SIZE:-512}"
 
-# Upload to Spaces
-upload_to_spaces() {
-    local local_path="$1"
-    local remote_key="$2"
-    local content_type="${3:-application/octet-stream}"
-
-    # Redirect progress output to stderr so only URL is captured in variable
-    aws s3 cp "$local_path" "s3://$SPACES_BUCKET/$remote_key" \
-        --endpoint-url "$SPACES_ENDPOINT" \
-        --acl public-read \
-        --content-type "$content_type" >&2
-
-    echo "$SPACES_ENDPOINT/$SPACES_BUCKET/$remote_key"
-}
-
-run_viewcrafter() {
-    echo "Running ViewCrafter pipeline..."
-
-    cd /mnt/splatwalk/ViewCrafter
-
-    # Generate novel views from input images
-    python inference.py \
-        --input_dir "$INPUT_DIR" \
-        --output_dir "$OUTPUT_DIR/viewcrafter" \
-        --num_views 30 \
-        --save_video \
-        || return 1
-
-    # Convert frames to 3DGS using DUSt3R
-    cd /mnt/splatwalk/InstantSplat/dust3r
-    python demo.py \
-        --images "$OUTPUT_DIR/viewcrafter/frames" \
-        --output "$OUTPUT_DIR/viewcrafter/pointcloud.ply" \
-        || return 1
-
-    echo "ViewCrafter pipeline completed"
-    return 0
-}
-
-run_instantsplat() {
-    echo "Running InstantSplat pipeline..."
-
-    # Set up directory structure
-    local scene_dir="$OUTPUT_DIR/scene"
-    mkdir -p "$scene_dir/images"
-
-    # If video input, extract frames with ffmpeg first
-    if [ "$HAS_VIDEO" -eq 1 ]; then
-        echo "Extracting frames from video: $VIDEO_FILE"
-        local frames_dir="$INPUT_DIR/frames"
-        mkdir -p "$frames_dir"
-        ffmpeg -i "$VIDEO_FILE" -qscale:v 1 -vf "fps=1" "$frames_dir/frame-%04d.jpg" 2>&1
-        local extracted=$(ls -1 "$frames_dir"/*.jpg 2>/dev/null | wc -l)
-        echo "Extracted $extracted frames from video (1 fps)"
-        # Point preprocessing at the extracted frames directory
-        export INPUT_DIR="$frames_dir"
-    fi
-
-    # Preprocess images: resize all to consistent dimensions (512x512)
-    # InstantSplat requires all images to have the same dimensions
-    echo "Preprocessing images to consistent 512x512 size..."
-    python3 << 'PREPROCESS_SCRIPT'
+echo "Preprocessing images to ${IMAGE_SIZE}x${IMAGE_SIZE}..."
+python3 << 'PREPROCESS_SCRIPT'
 import os
 import sys
-from PIL import Image
+from PIL import Image, ImageOps
 from pathlib import Path
 
-input_dir = os.environ.get('INPUT_DIR', '/data/input')
-output_dir = os.path.join(os.environ.get('OUTPUT_DIR', '/data/output'), 'scene', 'images')
-target_size = (512, 512)
+input_dir = os.environ["INPUT_DIR"]
+output_dir = os.path.join(os.environ["SCENE_DIR"], "images")
+size = int(os.environ.get("IMAGE_SIZE", "512"))
+target = (size, size)
 
 os.makedirs(output_dir, exist_ok=True)
 
-for img_file in sorted(Path(input_dir).glob('*')):
-    if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-        try:
-            img = Image.open(img_file).convert('RGB')
-            # Resize with center crop to maintain aspect ratio quality
-            # First resize so smaller dimension is target, then center crop
-            w, h = img.size
-            scale = max(target_size[0] / w, target_size[1] / h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            # Center crop to target size
-            left = (new_w - target_size[0]) // 2
-            top = (new_h - target_size[1]) // 2
-            img = img.crop((left, top, left + target_size[0], top + target_size[1]))
-            # Save as JPG
-            out_path = os.path.join(output_dir, img_file.stem + '.jpg')
-            img.save(out_path, 'JPEG', quality=95)
-            print(f"  Processed: {img_file.name} -> {target_size[0]}x{target_size[1]}")
-        except Exception as e:
-            print(f"  Error processing {img_file.name}: {e}", file=sys.stderr)
+for img_file in sorted(Path(input_dir).glob("*")):
+    if img_file.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+        continue
+    try:
+        img = Image.open(img_file)
+        img = ImageOps.exif_transpose(img).convert("RGB")  # respect EXIF orientation
+        w, h = img.size
+        scale = max(target[0] / w, target[1] / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - target[0]) // 2
+        top = (new_h - target[1]) // 2
+        img = img.crop((left, top, left + target[0], top + target[1]))
+        img.save(os.path.join(output_dir, img_file.stem + ".jpg"), "JPEG", quality=95)
+        print(f"  Processed: {img_file.name} -> {target[0]}x{target[1]}")
+    except Exception as e:
+        print(f"  Error processing {img_file.name}: {e}", file=sys.stderr)
 PREPROCESS_SCRIPT
 
-    local num_images=$(ls -1 "$scene_dir/images" | wc -l)
-    echo "Prepared $num_images images (all 512x512)"
+NUM_IMAGES=$(ls -1 "$SCENE_DIR/images" | wc -l | tr -d ' ')
+echo "Prepared $NUM_IMAGES images (${IMAGE_SIZE}x${IMAGE_SIZE})"
+[ "$NUM_IMAGES" -lt 2 ] && fail "Preprocessing produced fewer than 2 usable images"
 
-    cd /mnt/splatwalk/InstantSplat
+# Cap views for MASt3R memory (pairwise matching is O(n^2) in VRAM)
+MAX_VIEWS="${MAX_N_VIEWS:-24}"
+N_VIEWS=$NUM_IMAGES
+[ "$N_VIEWS" -gt "$MAX_VIEWS" ] && N_VIEWS=$MAX_VIEWS
+TRAIN_ITERS="${TRAIN_ITERATIONS:-10000}"
 
-    # Cap views for MASt3R memory (configurable via MAX_N_VIEWS)
-    local max_views=${MAX_N_VIEWS:-24}
-    local n_views=$num_images
-    if [ "$n_views" -gt "$max_views" ]; then
-        n_views=$max_views
-    fi
+# ============================================================================
+# Stage 1: MASt3R geometry initialization (point cloud + camera poses)
+# ============================================================================
 
-    # Step 1: Initialize geometry with init_geo.py (creates point cloud and camera poses)
-    # This is the correct script for inference - init_test_pose.py is for evaluation with GT
-    echo "Step 1/2: Running geometry initialization with MASt3R..."
-    python init_geo.py \
-        --source_path "$scene_dir" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
-        --n_views "$n_views" \
-        --focal_avg \
-        --co_vis_dsp \
-        --conf_aware_ranking \
-        2>&1 || {
-            echo "init_geo.py failed"
-            ls -la "$scene_dir/sparse_"*/0/ 2>/dev/null || echo "No sparse output"
-            return 1
-        }
+cd /mnt/splatwalk/InstantSplat
 
-    # Step 2: Train Gaussian Splatting with pose optimization
-    echo "Step 2/2: Training Gaussian Splatting..."
-    python train.py \
-        --source_path "$scene_dir" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
-        --iterations 3000 \
-        --n_views "$n_views" \
-        --pp_optimizer \
-        --optim_pose \
-        || return 1
+notify_slack "Stage 1: Geometry init (MASt3R, $N_VIEWS views)..."
+echo "Stage 1: Running geometry initialization with MASt3R ($N_VIEWS views)..."
+python init_geo.py \
+    --source_path "$SCENE_DIR" \
+    --model_path "$OUTPUT_DIR/model" \
+    --n_views "$N_VIEWS" \
+    --focal_avg \
+    --co_vis_dsp \
+    --conf_aware_ranking \
+    2>&1 || fail "Stage 1 (init_geo.py) failed"
+notify_slack "Stage 1 complete: point cloud + camera poses"
 
-    echo "InstantSplat pipeline completed"
-    return 0
-}
+# ============================================================================
+# Stage 2: InstantSplat training (3DGS with pose optimization)
+# ============================================================================
 
-run_combined() {
-    echo "Running Combined (MASt3R) pipeline..."
+notify_slack "Stage 2: Training splat ($TRAIN_ITERS iterations)..."
+echo "Stage 2: Training Gaussian Splatting ($TRAIN_ITERS iterations)..."
+python train.py \
+    --source_path "$SCENE_DIR" \
+    --model_path "$OUTPUT_DIR/model" \
+    --iterations "$TRAIN_ITERS" \
+    --n_views "$N_VIEWS" \
+    --pp_optimizer \
+    --optim_pose \
+    || fail "Stage 2 (train.py) failed"
+notify_slack "Stage 2 complete: splat trained"
 
-    cd /mnt/splatwalk/InstantSplat/mast3r
+FINAL_MODEL_PATH="$OUTPUT_DIR/model"
+DRONE_AGL=""
 
-    # Run MASt3R for dense reconstruction
-    python demo.py \
-        --images "$INPUT_DIR" \
-        --output_dir "$OUTPUT_DIR/combined" \
-        --model_name MASt3R_ViTLarge \
-        || return 1
+# ============================================================================
+# Stage 3 (aerial mode only): Top-down progressive zoom descent
+# ============================================================================
 
-    echo "Combined pipeline completed"
-    return 0
-}
-
-run_walkable() {
-    echo "Running Walkable Splat pipeline (Stages 1-4)..."
-    notify_slack "Starting walkable pipeline with $(ls -1 "$INPUT_DIR"/*.jpg "$INPUT_DIR"/*.jpeg "$INPUT_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ') images"
-
-    # === STAGES 1-2: Aerial splat (reuses InstantSplat flow) ===
-    local scene_dir="$OUTPUT_DIR/scene"
-    mkdir -p "$scene_dir/images"
-
-    # If video input, extract frames
-    if [ "$HAS_VIDEO" -eq 1 ]; then
-        echo "Extracting frames from video: $VIDEO_FILE"
-        local frames_dir="$INPUT_DIR/frames"
-        mkdir -p "$frames_dir"
-        ffmpeg -i "$VIDEO_FILE" -qscale:v 1 -vf "fps=1" "$frames_dir/frame-%04d.jpg" 2>&1
-        export INPUT_DIR="$frames_dir"
-    fi
-
-    # Preprocess images to 512x512
-    echo "Preprocessing images to consistent 512x512 size..."
-    python3 << 'PREPROCESS_SCRIPT'
-import os, sys
-from PIL import Image
+if [ "$PIPELINE_MODE" = "aerial" ]; then
+    # Estimate drone AGL from EXIF GPS altitude + ground elevation (open-meteo)
+    echo "Extracting EXIF GPS altitude for descent scaling..."
+    DRONE_AGL=$(python3 -c "
+import sys, json, urllib.request
 from pathlib import Path
-
-input_dir = os.environ.get('INPUT_DIR', '/data/input')
-output_dir = os.path.join(os.environ.get('OUTPUT_DIR', '/data/output'), 'scene', 'images')
-target_size = (512, 512)
-os.makedirs(output_dir, exist_ok=True)
-
-for img_file in sorted(Path(input_dir).glob('*')):
-    if img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-        try:
-            img = Image.open(img_file).convert('RGB')
-            w, h = img.size
-            scale = max(target_size[0] / w, target_size[1] / h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-            left = (new_w - target_size[0]) // 2
-            top = (new_h - target_size[1]) // 2
-            img = img.crop((left, top, left + target_size[0], top + target_size[1]))
-            out_path = os.path.join(output_dir, img_file.stem + '.jpg')
-            img.save(out_path, 'JPEG', quality=95)
-            print(f"  Processed: {img_file.name} -> {target_size[0]}x{target_size[1]}")
-        except Exception as e:
-            print(f"  Error processing {img_file.name}: {e}", file=sys.stderr)
-PREPROCESS_SCRIPT
-
-    local num_images=$(ls -1 "$scene_dir/images" | wc -l)
-    echo "Prepared $num_images images (all 512x512)"
-
-    cd /mnt/splatwalk/InstantSplat
-
-    # Cap views for MASt3R memory (24 for H100 80GB, 16 for RTX 4000 20GB)
-    local max_views=${MAX_N_VIEWS:-24}
-    local n_views=$num_images
-    if [ "$n_views" -gt "$max_views" ]; then
-        n_views=$max_views
-    fi
-    local train_iters=${TRAIN_ITERATIONS:-10000}
-
-    # Stage 1: Geometry init
-    notify_slack "Stage 1: Geometry init (MASt3R, $n_views views)..."
-    echo "Stage 1/6: Running geometry initialization with MASt3R ($n_views views)..."
-    python init_geo.py \
-        --source_path "$scene_dir" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
-        --n_views "$n_views" \
-        --focal_avg \
-        --co_vis_dsp \
-        --conf_aware_ranking \
-        2>&1 || {
-            notify_slack "Failed at Stage 1: init_geo.py" "error"
-            return 1
-        }
-    notify_slack "Stage 1 complete: point cloud generated"
-
-    # Stage 2: Train aerial splat
-    notify_slack "Stage 2: Training aerial splat ($train_iters iterations)..."
-    echo "Stage 2/6: Training Gaussian Splatting ($train_iters iterations)..."
-    python train.py \
-        --source_path "$scene_dir" \
-        --model_path "$OUTPUT_DIR/instantsplat" \
-        --iterations "$train_iters" \
-        --n_views "$n_views" \
-        --pp_optimizer \
-        --optim_pose \
-        || {
-            notify_slack "Failed at Stage 2: train.py" "error"
-            return 1
-        }
-    notify_slack "Stage 2 complete: aerial splat trained"
-
-    # Extract EXIF GPS + altitude for dynamic descent and geographic enrichment
-    echo "Extracting EXIF GPS and altitude from drone images..."
-    DRONE_AGL=0
-    EXIF_COORDS=""
-    eval "$(python3 -c "
-import sys
-from pathlib import Path
+from PIL import Image, ExifTags
 try:
-    from PIL import Image, ExifTags
-    imgs = sorted(Path('$INPUT_DIR').glob('*'))
-    for f in imgs:
-        if f.suffix.lower() not in ('.jpg','.jpeg','.png'): continue
-        img = Image.open(f)
-        exif = img._getexif()
-        if not exif: continue
+    for f in sorted(Path('$INPUT_DIR').glob('*')):
+        if f.suffix.lower() not in ('.jpg', '.jpeg', '.png'):
+            continue
+        exif = Image.open(f)._getexif()
+        if not exif:
+            continue
         gps = exif.get(ExifTags.Base.GPSInfo)
-        if not gps: continue
-        tags = {}
-        for k,v in gps.items():
-            tags[ExifTags.GPSTAGS.get(k,k)] = v
-        if 'GPSLatitude' not in tags: continue
-        def dms(d,r):
-            v=float(d[0])+float(d[1])/60+float(d[2])/3600
-            return -v if r in ('S','W') else v
-        lat=dms(tags['GPSLatitude'],tags.get('GPSLatitudeRef','N'))
-        lon=dms(tags['GPSLongitude'],tags.get('GPSLongitudeRef','W'))
-        alt=float(tags['GPSAltitude']) if 'GPSAltitude' in tags else 0
-        print(f'EXIF_COORDS=\"{lat:.6f},{lon:.6f}\"')
-        print(f'EXIF_ALT={alt:.1f}')
+        if not gps:
+            continue
+        tags = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps.items()}
+        if 'GPSLatitude' not in tags or 'GPSAltitude' not in tags:
+            continue
+        def dms(d, r):
+            v = float(d[0]) + float(d[1]) / 60 + float(d[2]) / 3600
+            return -v if r in ('S', 'W') else v
+        lat = dms(tags['GPSLatitude'], tags.get('GPSLatitudeRef', 'N'))
+        lon = dms(tags['GPSLongitude'], tags.get('GPSLongitudeRef', 'W'))
+        alt = float(tags['GPSAltitude'])
+        if alt <= 0:
+            continue
+        url = f'https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}'
+        elev = json.loads(urllib.request.urlopen(url, timeout=5).read()).get('elevation', 0)
+        if isinstance(elev, list):
+            elev = elev[0]
+        print(f'{max(10, alt - elev):.0f}')
         break
 except Exception as e:
-    print(f'# EXIF extraction failed: {e}', file=sys.stderr)
-" 2>&1)" || true
+    print(f'EXIF AGL extraction failed: {e}', file=sys.stderr)
+" 2>/dev/null) || true
+    echo "Drone AGL: ${DRONE_AGL:-unknown (using descent default)}"
 
-    # Save EXIF GPS data to JSON for ground view generation
-    python3 -c "
-import sys
-sys.path.insert(0, '/mnt/splatwalk/scripts')
-try:
-    from align_geo_colmap import extract_exif_gps, save_exif_gps_json
-    gps = extract_exif_gps('$INPUT_DIR')
-    if gps:
-        save_exif_gps_json(gps, '$OUTPUT_DIR/exif_gps.json')
-except Exception as e:
-    print(f'EXIF GPS extraction warning: {e}')
-" 2>&1 || true
-
-    # Compute drone AGL from EXIF altitude + ground elevation
-    if [ -n "$EXIF_COORDS" ] && [ "${EXIF_ALT:-0}" != "0" ]; then
-        echo "  EXIF coordinates: $EXIF_COORDS, altitude: ${EXIF_ALT}m"
-        IFS=',' read -r EXIF_LAT EXIF_LON <<< "$EXIF_COORDS"
-        GROUND_ELEV=$(curl -s --max-time 5 \
-            "https://api.open-meteo.com/v1/elevation?latitude=${EXIF_LAT}&longitude=${EXIF_LON}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);e=d.get('elevation',0);print(e[0] if isinstance(e,list) else e)" 2>/dev/null || echo "0")
-        if [ "$GROUND_ELEV" != "0" ]; then
-            DRONE_AGL=$(python3 -c "print(max(0, ${EXIF_ALT} - ${GROUND_ELEV}))")
-            echo "  Ground elevation: ${GROUND_ELEV}m, Drone AGL: ${DRONE_AGL}m"
-        fi
-    fi
-
-    # ODM Orthomosaic (full-res, all images → seamless Level 0 — fatal on failure)
-    local ODM_OUTPUT="$OUTPUT_DIR/odm"
-    local ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
-    local ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
-    if [ ! -f "$ODM_TAR" ]; then
-        notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
-        docker pull opendronemap/odm:latest \
-            || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; return 1; }
-        docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
-            || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; return 1; }
-        notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
-    fi
-    notify_slack "ODM: loading Docker image + generating orthomosaic..."
-    docker load -i "$ODM_TAR" 2>/dev/null
-    mkdir -p "$ODM_OUTPUT"
-    docker run --rm \
-        -v "$INPUT_DIR:/datasets/project/images" \
-        -v "$ODM_OUTPUT:/datasets/project" \
-        opendronemap/odm \
-        --project-path /datasets project \
-        --dsm \
-        --dtm \
-        --orthophoto-resolution 5 \
-        --max-concurrency 4 \
-        2>&1 | tail -50 \
-        || { notify_slack "FATAL: ODM failed" "error"; return 1; }
-    notify_slack "ODM complete (orthophoto + DSM/DTM)"
-
-    # Ortho tile generation (requires ODM orthophoto — fatal on failure)
-    if [ ! -f "$ODM_ORTHO_TIF" ]; then
-        notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
-        return 1
-    fi
-    notify_slack "Ortho: generating 2D tile pyramid from ODM orthophoto..."
-    python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
-        --odm_orthophoto "$ODM_ORTHO_TIF" \
-        --scene_path "$scene_dir" \
-        --output_dir "$OUTPUT_DIR/ortho" \
-        --job_id "$JOB_ID" \
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        || { notify_slack "FATAL: Ortho tile generation failed" "error"; return 1; }
-
-    # Stage 3: Top-Down Progressive Zoom Descent
-    notify_slack "Stage 3: Top-down zoom descent (5 altitude levels)..."
-    echo "Stage 3/6: Top-down progressive zoom descent..."
-    local descent_args=(
-        --model_path "$OUTPUT_DIR/instantsplat"
-        --scene_path "$scene_dir"
+    notify_slack "Stage 3: Top-down zoom descent..."
+    echo "Stage 3: Top-down progressive zoom descent..."
+    DESCENT_ARGS=(
+        --model_path "$OUTPUT_DIR/model"
+        --scene_path "$SCENE_DIR"
         --output_dir "$OUTPUT_DIR/descent"
-        --altitudes "1.0,0.5,0.25,0.12,0.05"
-        --retrain_iterations 2000
+        --altitudes "${DESCENT_ALTITUDES:-1.0,0.5,0.25,0.12,0.05}"
+        --retrain_iterations "${DESCENT_ITERATIONS:-2000}"
         --max_images_per_level 64
         --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
-        --job_id "${JOB_ID:-}"
+        --job_id "$JOB_ID"
     )
-    [ "$DRONE_AGL" != "0" ] && descent_args+=(--drone_agl "$DRONE_AGL")
-    [ -f "$ODM_ORTHO_TIF" ] && descent_args+=(--odm_orthophoto "$ODM_ORTHO_TIF")
+    [ -n "$DRONE_AGL" ] && DESCENT_ARGS+=(--drone_agl "$DRONE_AGL")
 
-    python /mnt/splatwalk/scripts/render_zoom_descent.py "${descent_args[@]}" \
-        || {
-            notify_slack "Failed at Stage 3: render_zoom_descent.py" "error"
-            return 1
-        }
+    python /mnt/splatwalk/scripts/render_zoom_descent.py "${DESCENT_ARGS[@]}" \
+        || fail "Stage 3 (render_zoom_descent.py) failed"
     notify_slack "Stage 3 complete: zoom descent finished"
 
-    local final_model_path="$OUTPUT_DIR/descent/final"
+    FINAL_MODEL_PATH="$OUTPUT_DIR/descent/final"
+fi
 
-    # Stage 3b: Ground-Level View Generation (3DEP DEM + ODM texture)
-    notify_slack "Stage 3b: generating ground-level views via 3DEP DEM..."
-    python /mnt/splatwalk/scripts/generate_ground_views.py \
-        --scene_path "$scene_dir" \
-        --model_path "$final_model_path" \
-        --input_dir "$INPUT_DIR" \
-        --output_dir "$OUTPUT_DIR/ground_views" \
-        --odm_orthophoto "${ODM_ORTHO_TIF:-}" \
-        --exif_gps_json "$OUTPUT_DIR/exif_gps.json" \
-        --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-        --job_id "${JOB_ID:-}" \
-        || {
-            notify_slack "Stage 3b (ground views) failed" "error"
-            return 1
-        }
-    notify_slack "Stage 3b complete: ground views generated"
+# ============================================================================
+# Stage 4: Compress to .splat + manifest + CDN upload
+# ============================================================================
 
-    # Stage 3c: Retrain with ground views (3000 iterations)
-    notify_slack "Stage 3c: retraining with ground views (3000 iterations)..."
-    cd /mnt/splatwalk/InstantSplat
-    local n_views_ground=$(ls -1 "$scene_dir/images"/*.jpg 2>/dev/null | wc -l)
-    [ "$n_views_ground" -gt 24 ] && n_views_ground=24
-    python train.py \
-        --source_path "$scene_dir" \
-        --model_path "$final_model_path" \
-        --iterations 3000 \
-        --n_views "$n_views_ground" \
-        --pp_optimizer \
-        --optim_pose \
-        --test_iterations 10001 \
-        --densify_from_iter 200 \
-        --densify_until_iter 2250 \
-        --densification_interval 100 \
-        --densify_grad_threshold 0.0005 \
-        || {
-            notify_slack "Stage 3c (retrain with ground views) failed" "error"
-            return 1
-        }
-    notify_slack "Stage 3c complete: retrained with ground views"
+notify_slack "Stage 4: Compressing splat + uploading to CDN..."
+echo "Stage 4: Compressing splat + generating viewer assets..."
+ASSET_ARGS=(
+    --model_path "$FINAL_MODEL_PATH"
+    --output_dir "$OUTPUT_DIR/demo"
+    --job_id "$JOB_ID"
+    --scene_scale "${SCENE_SCALE:-50.0}"
+    --prune_ratio "${PRUNE_RATIO:-0.20}"
+    --source_images "$IMAGE_COUNT"
+    --slack_webhook_url "${SLACK_WEBHOOK_URL:-}"
+)
+[ -n "$DRONE_AGL" ] && ASSET_ARGS+=(--drone_agl "$DRONE_AGL")
 
-    # Stage 4: Game-Level Scene Construction (.glb from ODM outputs)
-    notify_slack "Stage 4: Building game-level scene (.glb)..."
-    echo "Stage 4/6: Building game-level scene (.glb)..."
-    python /mnt/splatwalk/scripts/build_game_scene.py \
-        --orthophoto "$ODM_ORTHO_TIF" \
-        --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
-        --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
-        --images "$INPUT_DIR" \
-        --scene_path "$scene_dir" \
-        --model_path "$final_model_path" \
-        --output "$OUTPUT_DIR/scene.glb" \
-        --texture_library "/mnt/splatwalk/textures/" \
-        --scene_scale 50.0 \
-        --gemini_api_key "${GEMINI_API_KEY:-}" \
-        || {
-            notify_slack "Stage 4 (scene construction) failed (non-fatal)" "info"
-            echo "WARNING: Game-level scene construction failed, continuing without .glb"
-        }
+python /mnt/splatwalk/scripts/generate_viewer_assets.py "${ASSET_ARGS[@]}" \
+    || fail "Stage 4 (generate_viewer_assets.py) failed"
 
-    # Stage 5: Quality Gating
-    echo "Stage 5/6: Quality gate confidence scoring..."
-    python /mnt/splatwalk/scripts/quality_gate.py \
-        --model_path "$final_model_path" \
-        --real_images "$scene_dir/images" \
-        --output_dir "$OUTPUT_DIR/walkable" \
-        || {
-            notify_slack "Stage 5 failed (non-fatal), using model directly" "info"
-            echo "WARNING: Quality gate failed, copying model directly"
-            mkdir -p "$OUTPUT_DIR/walkable"
-            cp -r "$final_model_path"/* "$OUTPUT_DIR/walkable/" 2>/dev/null || true
-        }
-    notify_slack "Stage 5 complete"
-
-    echo "Walkable Splat pipeline completed"
-    return 0
-}
-
-run_mesh() {
-    echo "Running Mesh pipeline (ODM → aerial GLB + ground GLB)..."
-    notify_slack "Starting mesh pipeline with $(ls -1 "$INPUT_DIR"/*.jpg "$INPUT_DIR"/*.jpeg "$INPUT_DIR"/*.png 2>/dev/null | wc -l | tr -d ' ') images"
-
-    # === ODM Orthomosaic + DSM/DTM (cached on volume per job_id) ===
-    local ODM_OUTPUT="$OUTPUT_DIR/odm"
-    local ODM_TAR="/mnt/splatwalk/odm-docker.tar.gz"
-    local ODM_ORTHO_TIF="$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif"
-    local ODM_CACHE="/mnt/splatwalk/cache/odm/${JOB_ID}"
-
-    # Check for cached ODM output on volume (survives droplet destruction)
-    if [ -f "$ODM_CACHE/odm_orthophoto/odm_orthophoto.tif" ] && \
-       [ -f "$ODM_CACHE/odm_dem/dsm.tif" ]; then
-        notify_slack "ODM: using cached output from volume (skipping ~25 min rebuild)"
-        mkdir -p "$ODM_OUTPUT"
-        cp -r "$ODM_CACHE"/* "$ODM_OUTPUT/"
-        echo "  Restored ODM cache: $(du -sh "$ODM_OUTPUT" | cut -f1)"
-    else
-        if [ ! -f "$ODM_TAR" ]; then
-            notify_slack "ODM: Docker image not cached — pulling and saving to volume (~5GB)..."
-            docker pull opendronemap/odm:latest \
-                || { notify_slack "FATAL: failed to pull ODM Docker image" "error"; return 1; }
-            docker save opendronemap/odm:latest | gzip > "$ODM_TAR" \
-                || { notify_slack "FATAL: failed to save ODM Docker image to volume" "error"; return 1; }
-            notify_slack "ODM Docker image cached on volume ($(du -h "$ODM_TAR" | cut -f1))"
-        fi
-        notify_slack "ODM: loading Docker image + generating orthomosaic + DSM/DTM..."
-        docker load -i "$ODM_TAR" 2>/dev/null
-        mkdir -p "$ODM_OUTPUT"
-        docker run --rm \
-            -v "$INPUT_DIR:/datasets/project/images" \
-            -v "$ODM_OUTPUT:/datasets/project" \
-            opendronemap/odm \
-            --project-path /datasets project \
-            --dsm \
-            --dtm \
-            --orthophoto-resolution 5 \
-            --max-concurrency 4 \
-            2>&1 | tail -50 \
-            || { notify_slack "FATAL: ODM failed" "error"; return 1; }
-        notify_slack "ODM complete (orthophoto + DSM/DTM)"
-
-        # Cache ODM output on volume for next run
-        if [ -f "$ODM_OUTPUT/odm_orthophoto/odm_orthophoto.tif" ]; then
-            mkdir -p "$ODM_CACHE"
-            cp -r "$ODM_OUTPUT/odm_orthophoto" "$ODM_OUTPUT/odm_dem" "$ODM_CACHE/" 2>/dev/null || true
-            echo "  ODM output cached to volume: $(du -sh "$ODM_CACHE" | cut -f1)"
-        fi
-    fi
-
-    if [ ! -f "$ODM_ORTHO_TIF" ]; then
-        notify_slack "FATAL: ODM orthophoto not found at $ODM_ORTHO_TIF" "error"
-        return 1
-    fi
-
-    # === Extract EXIF GPS + altitude ===
-    DRONE_AGL=63  # default
-    eval "$(python3 -c "
-import sys
-from pathlib import Path
-try:
-    from PIL import Image, ExifTags
-    for f in sorted(Path('$INPUT_DIR').glob('*')):
-        if f.suffix.lower() not in ('.jpg','.jpeg','.png'): continue
-        img = Image.open(f)
-        exif = img._getexif()
-        if not exif: continue
-        gps = exif.get(ExifTags.Base.GPSInfo)
-        if not gps: continue
-        tags = {}
-        for k,v in gps.items():
-            tags[ExifTags.GPSTAGS.get(k,k)] = v
-        if 'GPSLatitude' not in tags: continue
-        def dms(d,r):
-            v=float(d[0])+float(d[1])/60+float(d[2])/3600
-            return -v if r in ('S','W') else v
-        alt=float(tags['GPSAltitude']) if 'GPSAltitude' in tags else 0
-        if alt > 0:
-            lat=dms(tags['GPSLatitude'],tags.get('GPSLatitudeRef','N'))
-            lon=dms(tags['GPSLongitude'],tags.get('GPSLongitudeRef','W'))
-            import urllib.request, json
-            url=f'https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}'
-            resp=json.loads(urllib.request.urlopen(url, timeout=5).read())
-            elev=resp.get('elevation',0)
-            if isinstance(elev,list): elev=elev[0]
-            agl=max(10, alt-elev)
-            print(f'DRONE_AGL={agl:.0f}')
-        break
-except Exception as e:
-    print(f'# EXIF extraction failed: {e}', file=sys.stderr)
-" 2>&1)" || true
-    echo "Drone AGL: ${DRONE_AGL}m"
-
-    # === Ortho tile generation (cached on volume) ===
-    local ORTHO_CACHE="/mnt/splatwalk/cache/ortho/${JOB_ID}"
-    if [ -d "$ORTHO_CACHE/tiles" ] && [ -f "$ORTHO_CACHE/ortho_manifest.json" ]; then
-        notify_slack "Ortho: using cached tiles from volume (skipping ~5 min upscale)"
-        mkdir -p "$OUTPUT_DIR/ortho"
-        cp -r "$ORTHO_CACHE"/* "$OUTPUT_DIR/ortho/"
-        echo "  Restored ortho cache: $(du -sh "$ORTHO_CACHE" | cut -f1)"
-    else
-        notify_slack "Ortho: generating 2D tile pyramid..."
-        python /mnt/splatwalk/scripts/generate_ortho_tiles.py \
-            --odm_orthophoto "$ODM_ORTHO_TIF" \
-            --output_dir "$OUTPUT_DIR/ortho" \
-            --job_id "$JOB_ID" \
-            --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-            || notify_slack "Ortho tile generation failed (non-fatal)" "info"
-
-        # Cache ortho output on volume
-        if [ -d "$OUTPUT_DIR/ortho/tiles" ]; then
-            mkdir -p "$ORTHO_CACHE"
-            cp -r "$OUTPUT_DIR/ortho"/* "$ORTHO_CACHE/" 2>/dev/null || true
-            echo "  Ortho tiles cached to volume: $(du -sh "$ORTHO_CACHE" | cut -f1)"
-        fi
-    fi
-
-    # === Aerial GLB (cached on volume — only depends on ODM output) ===
-    local AERIAL_CACHE="/mnt/splatwalk/cache/aerial/${JOB_ID}"
-    if [ -f "$AERIAL_CACHE/aerial.glb" ] && [ -f "$AERIAL_CACHE/scene_transform.json" ]; then
-        notify_slack "Aerial GLB: using cached output from volume"
-        cp "$AERIAL_CACHE/aerial.glb" "$OUTPUT_DIR/aerial.glb"
-        cp "$AERIAL_CACHE/scene_transform.json" "$OUTPUT_DIR/scene_transform.json"
-        echo "  Restored aerial cache: $(du -sh "$AERIAL_CACHE" | cut -f1)"
-    else
-        notify_slack "Generating aerial GLB..."
-        python /mnt/splatwalk/scripts/generate_aerial_glb.py \
-            --orthophoto "$ODM_ORTHO_TIF" \
-            --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
-            --output "$OUTPUT_DIR/aerial.glb" \
-            --scene_scale 50.0 \
-            --upscale \
-            --scene_transform_out "$OUTPUT_DIR/scene_transform.json" \
-            || { notify_slack "FATAL: Aerial GLB generation failed" "error"; return 1; }
-
-        # Cache aerial GLB + scene_transform on volume
-        if [ -f "$OUTPUT_DIR/aerial.glb" ]; then
-            mkdir -p "$AERIAL_CACHE"
-            cp "$OUTPUT_DIR/aerial.glb" "$OUTPUT_DIR/scene_transform.json" "$AERIAL_CACHE/" 2>/dev/null || true
-            echo "  Aerial GLB cached to volume: $(du -sh "$AERIAL_CACHE" | cut -f1)"
-        fi
-    fi
-    notify_slack "Aerial GLB ready"
-
-    # === Ground GLB (game-level scene with PBR + vegetation) ===
-    notify_slack "Building ground-level scene GLB..."
-    python /mnt/splatwalk/scripts/build_game_scene.py \
-        --orthophoto "$ODM_ORTHO_TIF" \
-        --dsm "$ODM_OUTPUT/odm_dem/dsm.tif" \
-        --dtm "$ODM_OUTPUT/odm_dem/dtm.tif" \
-        --images "$INPUT_DIR" \
-        --output "$OUTPUT_DIR/scene.glb" \
-        --texture_library "/mnt/splatwalk/textures/" \
-        --scene_scale 50.0 \
-        --scene_transform "$OUTPUT_DIR/scene_transform.json" \
-        --gemini_api_key "${GEMINI_API_KEY:-}" \
-        || {
-            notify_slack "Ground GLB generation failed (non-fatal)" "info"
-            echo "WARNING: Ground GLB failed, aerial-only mode"
-        }
-
-    # === Quality Loop (Gemini scoring + iteration on ground GLB) ===
-    if [ -f "$OUTPUT_DIR/scene.glb" ] && [ -n "${GEMINI_API_KEY:-}" ]; then
-        local BUILD_ARGS="--orthophoto $ODM_ORTHO_TIF --dsm $ODM_OUTPUT/odm_dem/dsm.tif --dtm $ODM_OUTPUT/odm_dem/dtm.tif --images $INPUT_DIR --output $OUTPUT_DIR/scene.glb --texture_library /mnt/splatwalk/textures/ --scene_scale 50.0 --scene_transform $OUTPUT_DIR/scene_transform.json --gemini_api_key ${GEMINI_API_KEY:-}"
-        notify_slack "Quality loop: scoring ground GLB with Gemini..."
-        python /mnt/splatwalk/scripts/gemini_score_scene.py \
-            --glb_path "$OUTPUT_DIR/scene.glb" \
-            --orthophoto "$ODM_ORTHO_TIF" \
-            --scene_transform "$OUTPUT_DIR/scene_transform.json" \
-            --build_args "$BUILD_ARGS" \
-            --target_score 9 \
-            --max_iterations 3 \
-            --gemini_api_key "${GEMINI_API_KEY:-}" \
-            --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-            --job_id "${JOB_ID:-}" \
-            || notify_slack "Quality loop failed (non-fatal)" "info"
-    else
-        echo "Skipping quality loop (no scene.glb or no Gemini API key)"
-    fi
-
-    echo "Mesh pipeline completed"
-    return 0
-}
-
-convert_and_upload() {
-    local ply_path="$1"
-    local pipeline_name="$2"
-
-    echo "Compressing PLY to .splat..."
-
-    # Find the PLY file: prefer walkable > ground_views > descent/final models
-    if [ ! -f "$ply_path" ]; then
-        for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/descent/final"; do
-            ply_path=$(find "$search_dir" -name "point_cloud.ply" -path "*/iteration_*" 2>/dev/null | sort | tail -1)
-            if [ -n "$ply_path" ] && [ -f "$ply_path" ]; then
-                echo "Found PLY in: $search_dir"
-                break
-            fi
-        done
-    fi
-
-    if [ -z "$ply_path" ] || [ ! -f "$ply_path" ]; then
-        echo "Error: No PLY file found"
-        return 1
-    fi
-
-    local splat_path="$OUTPUT_DIR/output.splat"
-    local confidence_npy="$OUTPUT_DIR/walkable/per_gaussian_confidence.npy"
-
-    python /mnt/splatwalk/scripts/compress_splat.py \
-        "$ply_path" "$splat_path" \
-        --prune_ratio 0.20 \
-        --scene_scale 50.0 \
-        --confidence_npy "$confidence_npy" || return 1
-
-    if [ ! -f "$splat_path" ]; then
-        echo "Error: .splat compression failed"
-        return 1
-    fi
-
-    echo "Uploading results to Spaces..."
-
-    # Upload compressed splat
-    local splat_key="jobs/$JOB_ID/output/$pipeline_name/scene.splat"
-    local splat_url=$(upload_to_spaces "$splat_path" "$splat_key" "application/octet-stream")
-
-    # Upload scene.glb if generated (Stage 4)
-    if [ -f "$OUTPUT_DIR/scene.glb" ]; then
-        local glb_key="jobs/$JOB_ID/output/$pipeline_name/scene.glb"
-        upload_to_spaces "$OUTPUT_DIR/scene.glb" "$glb_key" "model/gltf-binary"
-        echo "Uploaded scene.glb"
-    fi
-
-    # Upload thumbnail if available
-    local thumb_url=""
-    local thumb_path=$(find "$OUTPUT_DIR" -name "thumbnail.jpg" -o -name "preview.jpg" | head -1)
-    if [ -f "$thumb_path" ]; then
-        local thumb_key="jobs/$JOB_ID/output/$pipeline_name/thumbnail.jpg"
-        thumb_url=$(upload_to_spaces "$thumb_path" "$thumb_key" "image/jpeg")
-    fi
-
-    # Create and upload manifest
-    create_manifest "success" "$splat_url" "$thumb_url"
-    local manifest_key="jobs/$JOB_ID/output/$pipeline_name/manifest.json"
-    upload_to_spaces "$OUTPUT_DIR/manifest.json" "$manifest_key" "application/json"
-
-    echo "Upload complete: $splat_url"
-    return 0
-}
-
-# Main execution
-echo "Starting $PIPELINE_MODE pipeline..."
-
-case "$PIPELINE_MODE" in
-    "viewcrafter")
-        if run_viewcrafter; then
-            convert_and_upload "$OUTPUT_DIR/viewcrafter/pointcloud.ply" "viewcrafter"
-        else
-            create_manifest "failed" "" "" "ViewCrafter processing failed"
-            upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/viewcrafter/manifest.json" "application/json"
-            exit 1
-        fi
-        ;;
-    "instantsplat")
-        if run_instantsplat; then
-            convert_and_upload "$OUTPUT_DIR/instantsplat/point_cloud/iteration_3000/point_cloud.ply" "instantsplat"
-        else
-            create_manifest "failed" "" "" "InstantSplat processing failed"
-            upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/instantsplat/manifest.json" "application/json"
-            exit 1
-        fi
-        ;;
-    "combined")
-        if run_combined; then
-            convert_and_upload "$OUTPUT_DIR/combined/pointcloud.ply" "combined"
-        else
-            create_manifest "failed" "" "" "Combined pipeline processing failed"
-            upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/combined/manifest.json" "application/json"
-            exit 1
-        fi
-        ;;
-    "walkable")
-        if run_walkable; then
-            notify_slack "Compressing and uploading splat to Spaces..."
-            # Find the trained Gaussian point cloud (not input.ply which is raw MASt3R output)
-            local_ply=""
-            for search_dir in "$OUTPUT_DIR/walkable" "$OUTPUT_DIR/descent/final" "$OUTPUT_DIR/instantsplat"; do
-                candidate=$(find "$search_dir" -path "*/point_cloud/iteration_*/point_cloud.ply" -type f 2>/dev/null | sort -t_ -k2 -n -r | head -1)
-                if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-                    local_ply="$candidate"
-                    break
-                fi
-            done
-            if convert_and_upload "$local_ply" "walkable"; then
-                # Append confidence metadata to manifest if available
-                if [ -f "$OUTPUT_DIR/walkable/confidence.json" ]; then
-                    python3 -c "
-import json
-with open('$OUTPUT_DIR/manifest.json') as f: m = json.load(f)
-with open('$OUTPUT_DIR/walkable/confidence.json') as f: c = json.load(f)
-m['confidence'] = c
-with open('$OUTPUT_DIR/manifest.json', 'w') as f: json.dump(m, f, indent=2)
-"
-                    upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
-                fi
-                notify_slack "Pipeline complete! Splat uploaded to Spaces" "success"
-            else
-                create_manifest "failed" "" "" "Walkable pipeline conversion/upload failed"
-                upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
-                notify_slack "Pipeline failed at upload/conversion stage" "error"
-                exit 1
-            fi
-        else
-            create_manifest "failed" "" "" "Walkable pipeline processing failed"
-            upload_to_spaces "$OUTPUT_DIR/manifest.json" "jobs/$JOB_ID/output/walkable/manifest.json" "application/json"
-            notify_slack "Pipeline failed" "error"
-            exit 1
-        fi
-        ;;
-    "mesh")
-        if run_mesh; then
-            notify_slack "Generating demo viewer assets..."
-            python /mnt/splatwalk/scripts/generate_viewer_assets.py \
-                --output_dir "$OUTPUT_DIR/demo" \
-                --aerial_glb "$OUTPUT_DIR/aerial.glb" \
-                --scene_glb "$OUTPUT_DIR/scene.glb" \
-                --scene_transform "$OUTPUT_DIR/scene_transform.json" \
-                --job_id "$JOB_ID" \
-                --drone_agl "${DRONE_AGL:-63}" \
-                --slack_webhook_url "${SLACK_WEBHOOK_URL:-}" \
-                || { notify_slack "generate_viewer_assets.py failed" "error"; exit 1; }
-            notify_slack "Pipeline complete! Mesh assets uploaded" "success"
-        else
-            notify_slack "Mesh pipeline failed" "error"
-            exit 1
-        fi
-        ;;
-    *)
-        echo "Error: Unknown pipeline mode: $PIPELINE_MODE"
-        exit 1
-        ;;
-esac
-
-notify_slack "Droplet self-destructing"
+notify_slack "Pipeline complete! Manifest: $SPACES_ENDPOINT/$SPACES_BUCKET/demo/$JOB_ID/manifest.json" "success"
 echo "Pipeline $PIPELINE_MODE completed successfully!"
 exit 0
